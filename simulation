@@ -1,0 +1,484 @@
+#############Simulation codes for HTE review###############
+#############Kosuke Inoue##################################
+#############Updated 2023/11/6#############################
+rm(list = ls(all.names = TRUE))
+
+###Install packages
+list.of.packages <- c( "dplyr","Hmisc", "FindIt", "dbarts", "grf", "rlearner",
+                       "BART", "tidytreatment", "dplyr", "tidybayes", "ggplot2")
+
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+lapply(list.of.packages, library, character.only = TRUE)
+
+###data generation from https://github.com/joerigdon/HTE/tree/master (Data2B)
+N<-10000
+  
+rmulti = function(prob, n) {
+  as.numeric(rMultinom(probs=matrix(prob, 1, length(prob)), m=n))
+}
+
+set.seed(123)
+##Set up data where B~bern(0.3), eGFR~norm(60, 20), age~norm(60,10), sex~bern(0.5)
+true = data.frame(age=rnorm(N, 68, 10), black=factor(rbinom(N, 1, 0.3)), sbp=rnorm(N, 140, 15), dbp=rnorm(N, 78, 12), 
+                  scr=rnorm(N, 1.07, 0.34), eGFR=rnorm(N, 72, 20), statin=factor(rbinom(N, 1, 0.43)), 
+                  aspirin=factor(rbinom(N, 1, 0.51)), fram=rnorm(N, 25, 12), smok=factor(rmulti(c(0.44, 0.42, 0.14), N)))
+
+##Do the eGFR/aspirin 2-variable interaction
+true$delta = NA #simulate delta
+length(true$delta[true$aspirin==1 & true$eGFR<=72])
+length(true$delta[true$aspirin==1 & true$eGFR>72])
+length(true$delta[true$aspirin==0 & true$eGFR<=72])
+length(true$delta[true$aspirin==0 & true$eGFR>72])
+
+##(i) asp, eGFR<=72, ATE=-1D = 0.016, d~M(0.052, 0.88, 0.068)
+true$delta[true$aspirin==1 & true$eGFR<=72] = rmulti(c(0.052, 0.88, 0.068), length(true$delta[true$aspirin==1 & true$eGFR<=72]))-2
+mean(true$delta[true$aspirin==1 & true$eGFR<=72]) #0.016
+
+##(ii) asp, eGFR>72, ATE=-5D = 0.08, d~M(0.020, 0.88, 0.1)
+true$delta[true$aspirin==1 & true$eGFR>72] = rmulti(c(0.020, 0.88, 0.1), length(true$delta[true$aspirin==1 & true$eGFR>72]))-2
+mean(true$delta[true$aspirin==1 & true$eGFR>72]) #0.080
+
+##(iii) no asp, eGFR<=72, ATE=7D = -0.112, d~M(0.116, 0.88, 0.004)
+true$delta[true$aspirin==0 & true$eGFR<=72] = rmulti(c(0.116, 0.88, 0.004), length(true$delta[true$aspirin==0 & true$eGFR<=72]))-2
+mean(true$delta[true$aspirin==0 & true$eGFR<=72]) #-0.11
+
+##(iv) no asp, eGFR>72, ATE=3D = -0.048, d~M(0.084, 0.88, 0.036)
+true$delta[true$aspirin==0 & true$eGFR>72] = rmulti(c(0.084, 0.88, 0.036), length(true$delta[true$aspirin==0 & true$eGFR>72]))-2
+mean(true$delta[true$aspirin==0 & true$eGFR>72]) #-0.049
+
+##Look within groups
+mean(true$delta) #-0.0155
+
+true$Y1 = NA
+true$Y0 = NA
+
+true$Y1[true$delta==-1] = 0
+true$Y0[true$delta==-1] = 1
+
+true$Y1[true$delta==1] = 1
+true$Y0[true$delta==1] = 0
+
+true$Y1[true$delta==0] = 0
+true$Y0[true$delta==0] = 0
+
+sum((true$Y1-true$Y0)!=true$delta) #they all equal delta
+mean(true$Y1-true$Y0) #-0.165 as specified above for ATE
+mean(true$delta)
+mean(true$Y1)
+mean(true$Y0)
+
+##Add in rowname
+true$UNIQID = paste("A", rownames(true), sep="")
+
+##Change types where necessary
+true$delta = factor(true$delta)
+true$Y1 = factor(true$Y1)
+true$Y0 = factor(true$Y0)
+
+##Name covs and categories
+covs=c("age", "black", "sbp", "dbp", "scr", "eGFR", "statin", "aspirin", "fram", "smok")
+ind.cat=c(0, 1, 0, 0, 0, 0, 1, 1, 0, 1)
+
+#Take random sample of potential outcomes to get experiment,
+set.seed(125)
+ind.trt = sample(N, N/2)
+true$T = 0
+true$T[ind.trt] = 1
+true$Y = NA
+true$Y[true$T==1] = true$Y1[true$T==1]
+true$Y[true$T==0] = true$Y0[true$T==0]
+true$Y = true$Y-1
+table(true$Y, true$T)
+mean(true$Y[true$T==1])-mean(true$Y[true$T==0]) 
+summary(true)
+
+#####################################################################################
+###Data analysis 
+#references: https://www.sciencedirect.com/science/article/pii/S0049089X22001211?via%3Dihub#appsec1)
+
+dat0<- true[, which (colnames(true) %in% 
+                    c("age", "black", "sbp", "dbp", "scr", "eGFR", "statin", "aspirin", "fram", "smok", "T", "Y"))]
+
+#####################################################################################
+library(glue)
+library(magrittr)
+library(stringr)
+dat00<-true[, which (colnames(true) %in% 
+                       c("age", "black", "sbp", "dbp", "scr", "eGFR", "statin", "aspirin", "fram", "smok", "T"))]
+covariates = (colnames(dat00))
+n_way=2 #add all 1-, 2- and 3-way interaction in the model
+covplus <- glue_collapse(covariates, sep=" + ")
+
+dat01 <- model.matrix(formula(glue("~({covplus})^{n_way}")), dat0) %>%
+  as_tibble() %>%
+  set_colnames(str_replace_all(colnames(.), ":", "_")) %>%
+  mutate(Y = dat0$Y)
+dat010 <-subset(dat01, select=-`(Intercept)`)
+dat010 <-subset(dat010, select=-Y)
+covariates2 = (colnames(dat010))
+covplus2 <- glue_collapse(covariates2, sep=" + ")
+
+#####################################################################################
+##Lasso
+set.seed(123)
+model_lasso <-FindIt(model.treat= Y ~ T, model.main= ~ age + black + sbp + dbp + scr + eGFR + statin + aspirin + fram + smok,
+                   model.int= ~ age + black + sbp + dbp + scr + eGFR + statin + aspirin + fram + smok, 
+                   data = dat0, type="continuous", treat.type="single", fit.glmnet=T) 
+
+pred_lasso <- predict(model_lasso)
+plot(pred_lasso, main="", ylab="predicted treatment effects")
+hte_lasso=as.data.frame(pred_lasso$data)
+text(30,2800, "ATE")
+
+tiff("plot_lasso.tiff", units="in", width=8, height=4, res=300)
+# Define breaks and their corresponding labels
+#breaks <- seq(-0.15, 0.15, by=0.05)
+#labels <- sprintf("%.2f", breaks) # Create labels for the breaks
+#labels[breaks == 0] <- "0" # Replace the label for 0 break with "0"
+dat_preg<-hte_lasso
+dat_preg$index <- as.numeric(row.names(dat_preg))
+dat_preg<-dat_preg[order(dat_preg$index), ]
+
+dat1<-dat0
+dat1$smok1<-0
+dat1$smok1[dat1$smok==1]<-1
+dat1$smok2<-0
+dat1$smok2[dat1$smok==2]<-1
+dat1 <- dat1 %>%
+  mutate_at(vars(black, statin, aspirin), ~ as.numeric(as.character(.)))
+dat_g<-dat1
+dat_g$Treatment.effect<-dat_preg$Treatment.effect
+p1<-ggplot(dat_g, aes(x=Treatment.effect, fill=as.factor(aspirin))) +
+  geom_histogram(binwidth=0.005, alpha=0.5, position="identity") +
+  scale_fill_manual(values=c("1"=rgb(0,0,1,1/8), "0"=rgb(1,0,0,1/8))) +
+  #scale_x_continuous(breaks=breaks, labels=labels) + # Set x-axis breaks and labels
+  labs(x="CATE using Lasso", y="Number of people", fill="Aspirin Group") +
+  theme(legend.position = "top",
+        plot.background = element_rect(fill = "white", colour = "white"), # Make plot background white
+        panel.background = element_rect(fill = "white", colour = NA), # Make panel background white
+        panel.grid.major = element_blank(), # Remove major grid lines
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "gray")) # Remove minor grid lines
+
+# Create the second ggplot object (scatter plot with line)
+p2 <- ggplot(data = hte_lasso, aes(x = eGFR, y = Treatment.effect)) +
+  geom_point(color = rgb(red = 0, green = 0, blue = 1, alpha = 0.2)) +
+  #geom_smooth(method = "loess", color = 'red', se=FALSE) + # 'loess' for lowess smoothing
+  labs(x = "eGFR", y = "CATE using LASSO")+
+  theme(plot.background = element_rect(fill = "white", colour = "white"), # Make plot background white
+        panel.background = element_rect(fill = "white", colour = NA), # Make panel background white
+        panel.grid.major = element_blank(), # Remove major grid lines
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "gray")) # Remove minor grid lines
+
+library(gridExtra)
+g_lasso<- grid.arrange(p1, p2,
+                       ncol=2)
+dev.off()
+
+#####################################################################################
+#Causal forest
+library(grf)
+dat1<-dat0
+dat1$smok1<-0
+dat1$smok1[dat1$smok==1]<-1
+dat1$smok2<-0
+dat1$smok2[dat1$smok==2]<-1
+dat1 <- dat1 %>%
+  mutate_at(vars(black, statin, aspirin), ~ as.numeric(as.character(.)))
+Y <-  (dat1$Y)
+W <-  (dat1$T)
+X0 <-  subset(dat1, select=-Y)
+X1 <-  subset(X0, select=-T)
+X2 <-  subset(X1, select=-smok)
+num.folds <- 10
+set.seed(123)
+folds <- sample(c(1:num.folds), replace=TRUE, size=N)
+model_grf <- causal_forest(X2, Y, W, 
+                        honesty = TRUE, 
+                        clusters=folds,
+                        tune.parameters="all")
+hte_grf <- predict(model_grf)$predictions
+
+tiff("plot_grf.tiff", units="in", width=8, height=4, res=300)
+dat_g<-dat1
+dat_g$Treatment.effect<-hte_grf
+p1<-ggplot(dat_g, aes(x=Treatment.effect, fill=as.factor(aspirin))) +
+  geom_histogram(binwidth=0.005, alpha=0.5, position="identity") +
+  scale_fill_manual(values=c("1"=rgb(0,0,1,1/8), "0"=rgb(1,0,0,1/8))) +
+  #scale_x_continuous(breaks=breaks, labels=labels) + # Set x-axis breaks and labels
+  labs(x="CATE using GRF", y="Number of people", fill="Aspirin Group") +
+  theme(legend.position = "top",
+        plot.background = element_rect(fill = "white", colour = "white"), # Make plot background white
+        panel.background = element_rect(fill = "white", colour = NA), # Make panel background white
+        panel.grid.major = element_blank(), # Remove major grid lines
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "gray")) # Remove minor grid lines
+
+# Create the second ggplot object (scatter plot with line)
+p2 <- ggplot(data = dat_g, aes(x = eGFR, y = Treatment.effect)) +
+  geom_point(color = rgb(red = 0, green = 0, blue = 1, alpha = 0.2)) +
+  #geom_smooth(method = "loess", color = 'red', se=FALSE) + # 'loess' for lowess smoothing
+  labs(x = "eGFR", y = "CATE using GRF")+
+  theme(plot.background = element_rect(fill = "white", colour = "white"), # Make plot background white
+        panel.background = element_rect(fill = "white", colour = NA), # Make panel background white
+        panel.grid.major = element_blank(), # Remove major grid lines
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "gray")) # Remove minor grid lines
+
+library(gridExtra)
+g_grf<- grid.arrange(p1, p2,
+                     ncol=2)
+dev.off()
+
+#####################################################################################
+#BART 
+library(BART); library(tidytreatment); library(dplyr); library(tidybayes); library(ggplot2)
+dat1<-dat0
+dat1$smok1<-0
+dat1$smok1[dat1$smok==1]<-1
+dat1$smok2<-0
+dat1$smok2[dat1$smok==2]<-1
+dat1 <- dat1 %>%
+  mutate_at(vars(black, statin, aspirin), ~ as.numeric(as.character(.)))
+Y <-  (dat1$Y)
+W <-  (dat1$T)
+X0 <-  subset(dat1, select=-Y)
+X1 <-  subset(X0, select=-T)
+X2 <-  subset(X1, select=-smok)
+
+# STEP 1 VS Model: Regress y ~ covariates
+var_select_bart <- wbart(x.train = X2, 
+                         y.train = Y,
+                         sparse = TRUE)
+
+# STEP 2: Variable selection
+# select most important vars from y ~ covariates model
+# very simple selection mechanism. Should use cross-validation in practice
+covar_ranking <- covariate_importance(var_select_bart)
+var_select <- covar_ranking %>% 
+  filter(avg_inclusion >= quantile(avg_inclusion, 0.5)) %>%
+  pull(variable)
+# change categorical variables to just one variable
+var_select <- unique(gsub("c1[1-3]$","c1", var_select))
+var_select
+
+# STEP 3 PS Model: Regress z ~ selected covariates
+# BART::pbart is for probit regression 
+prop_bart <- pbart(
+  x.train = dplyr::select(dat1, all_of(var_select)), 
+  y.train = pull(dat1, T)
+) 
+
+# store propensity score in data
+dat1$prop_score <-  prop_bart$prob.train.mean
+
+dat1$T <- as.logical(dat1$T)
+# Step 4 TE Model: Regress y ~ z + covariates + propensity score
+te_model <- wbart(
+  x.train = dplyr::select(dat1,-Y),
+  y.train = pull(dat1, Y),
+  x.test  = dplyr::select(dat1,-Y)
+)
+
+
+te<-  treatment_effects(te_model, treatment = "T", newdata = dat1)
+d.hte_bart <-te %>% summarise(hte_bart = median(cte))
+hte_bart<- d.hte_bart$hte_bart  
+tiff("plot_bart.tiff", units="in", width=8, height=4, res=300)
+dat_g<-dat1
+dat_g$Treatment.effect<-hte_bart
+p1<-ggplot(dat_g, aes(x=Treatment.effect, fill=as.factor(aspirin))) +
+  geom_histogram(binwidth=0.005, alpha=0.5, position="identity") +
+  scale_fill_manual(values=c("1"=rgb(0,0,1,1/8), "0"=rgb(1,0,0,1/8))) +
+  #scale_x_continuous(breaks=breaks, labels=labels) + # Set x-axis breaks and labels
+  labs(x="CATE using BART", y="Number of people", fill="Aspirin Group") +
+  theme(legend.position = "top",
+        plot.background = element_rect(fill = "white", colour = "white"), # Make plot background white
+        panel.background = element_rect(fill = "white", colour = NA), # Make panel background white
+        panel.grid.major = element_blank(), # Remove major grid lines
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "gray")) # Remove minor grid lines
+
+# Create the second ggplot object (scatter plot with line)
+p2 <- ggplot(data = dat_g, aes(x = eGFR, y = Treatment.effect)) +
+  geom_point(color = rgb(red = 0, green = 0, blue = 1, alpha = 0.2)) +
+  #geom_smooth(method = "loess", color = 'red', se=FALSE) + # 'loess' for lowess smoothing
+  labs(x = "eGFR", y = "CATE using BART")+
+  theme(plot.background = element_rect(fill = "white", colour = "white"), # Make plot background white
+        panel.background = element_rect(fill = "white", colour = NA), # Make panel background white
+        panel.grid.major = element_blank(), # Remove major grid lines
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "gray")) # Remove minor grid lines
+
+library(gridExtra)
+g_bart<- grid.arrange(p1, p2,
+                      ncol=2)
+dev.off()
+
+#####################################################################################
+#meta-learners
+dat1<-dat0
+dat1$smok1<-0
+dat1$smok1[dat1$smok==1]<-1
+dat1$smok2<-0
+dat1$smok2[dat1$smok==2]<-1
+dat1 <- dat1 %>%
+ mutate_at(vars(black, statin, aspirin), ~ as.numeric(as.character(.)))
+Y <-  (dat1$Y)
+W <-  (dat1$T)
+X0 <-  subset(dat1, select=-Y)
+X1 <-  subset(X0, select=-T)
+X2 <-  subset(X1, select=-smok)
+X3 <-  as.matrix(X2)
+
+dat10<-true[, which (colnames(true) %in% 
+                       c("age", "black", "sbp", "dbp", "scr", "eGFR", "statin", "aspirin", "fram", "smok"))]
+covariates = (colnames(dat10))
+n_way=2 #add all 1-, 2- and 3-way interaction in the model
+covplus <- glue_collapse(covariates, sep=" + ")
+
+dat11 <- model.matrix(formula(glue("~({covplus})^{n_way}")), dat10) %>%
+  as_tibble() %>%
+  set_colnames(str_replace_all(colnames(.), ":", "_"))
+
+dat110 <-subset(dat11, select=-`(Intercept)`)
+X3 <-  as.matrix(dat110)
+
+#install.packages("remotes")
+#remotes::install_github("xnie/rlearner")
+library(rlearner)
+set.seed(123)
+sboost_model = sboost(X3, W, Y)
+hte_sboost = predict(sboost_model, X3)
+tboost_model = tboost(X3, W, Y)
+hte_tboost = predict(tboost_model, X3)
+xboost_model = xboost(X3, W, Y)
+hte_xboost = predict(xboost_model, X3)
+rboost_model = rboost(X3, W, Y)
+hte_rboost = predict(rboost_model, X3)
+
+tiff("plot_slearner.tiff", units="in", width=8, height=4, res=300)
+dat_g<-dat1
+dat_g$Treatment.effect<-hte_sboost
+p1<-ggplot(dat_g, aes(x=Treatment.effect, fill=as.factor(aspirin))) +
+  geom_histogram(binwidth=0.005, alpha=0.5, position="identity") +
+  scale_fill_manual(values=c("1"=rgb(0,0,1,1/8), "0"=rgb(1,0,0,1/8))) +
+  #scale_x_continuous(breaks=breaks, labels=labels) + # Set x-axis breaks and labels
+  labs(x="CATE using S-Learner", y="Number of people", fill="Aspirin Group") +
+  theme(legend.position = "top",
+        plot.background = element_rect(fill = "white", colour = "white"), # Make plot background white
+        panel.background = element_rect(fill = "white", colour = NA), # Make panel background white
+        panel.grid.major = element_blank(), # Remove major grid lines
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "gray")) # Remove minor grid lines
+
+# Create the second ggplot object (scatter plot with line)
+p2 <- ggplot(data = dat_g, aes(x = eGFR, y = Treatment.effect)) +
+  geom_point(color = rgb(red = 0, green = 0, blue = 1, alpha = 0.2)) +
+  #geom_smooth(method = "loess", color = 'red', se=FALSE) + # 'loess' for lowess smoothing
+  labs(x = "eGFR", y = "CATE using S-Learner")+
+  theme(plot.background = element_rect(fill = "white", colour = "white"), # Make plot background white
+        panel.background = element_rect(fill = "white", colour = NA), # Make panel background white
+        panel.grid.major = element_blank(), # Remove major grid lines
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "gray")) # Remove minor grid lines
+
+library(gridExtra)
+g_slearner<- grid.arrange(p1, p2,
+                          ncol=2)
+dev.off()
+
+tiff("plot_tlearner.tiff", units="in", width=8, height=4, res=300)
+dat_g<-dat1
+dat_g$Treatment.effect<-hte_tboost
+p1<-ggplot(dat_g, aes(x=Treatment.effect, fill=as.factor(aspirin))) +
+  geom_histogram(binwidth=0.005, alpha=0.5, position="identity") +
+  scale_fill_manual(values=c("1"=rgb(0,0,1,1/8), "0"=rgb(1,0,0,1/8))) +
+  #scale_x_continuous(breaks=breaks, labels=labels) + # Set x-axis breaks and labels
+  labs(x="CATE using T-Learner", y="Number of people", fill="Aspirin Group") +
+  theme(legend.position = "top",
+        plot.background = element_rect(fill = "white", colour = "white"), # Make plot background white
+        panel.background = element_rect(fill = "white", colour = NA), # Make panel background white
+        panel.grid.major = element_blank(), # Remove major grid lines
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "gray")) # Remove minor grid lines
+
+# Create the second ggplot object (scatter plot with line)
+p2 <- ggplot(data = dat_g, aes(x = eGFR, y = Treatment.effect)) +
+  geom_point(color = rgb(red = 0, green = 0, blue = 1, alpha = 0.2)) +
+  #geom_smooth(method = "loess", color = 'red', se=FALSE) + # 'loess' for lowess smoothing
+  labs(x = "eGFR", y = "CATE using T-Learner")+
+  theme(plot.background = element_rect(fill = "white", colour = "white"), # Make plot background white
+        panel.background = element_rect(fill = "white", colour = NA), # Make panel background white
+        panel.grid.major = element_blank(), # Remove major grid lines
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "gray")) # Remove minor grid lines
+
+library(gridExtra)
+g_tlearner<- grid.arrange(p1, p2,
+                          ncol=2)
+dev.off()
+
+tiff("plot_xlearner.tiff", units="in", width=8, height=4, res=300)
+dat_g<-dat1
+dat_g$Treatment.effect<-hte_xboost
+p1<-ggplot(dat_g, aes(x=Treatment.effect, fill=as.factor(aspirin))) +
+  geom_histogram(binwidth=0.005, alpha=0.5, position="identity") +
+  scale_fill_manual(values=c("1"=rgb(0,0,1,1/8), "0"=rgb(1,0,0,1/8))) +
+  #scale_x_continuous(breaks=breaks, labels=labels) + # Set x-axis breaks and labels
+  labs(x="CATE using X-Learner", y="Number of people", fill="Aspirin Group") +
+  theme(legend.position = "top",
+        plot.background = element_rect(fill = "white", colour = "white"), # Make plot background white
+        panel.background = element_rect(fill = "white", colour = NA), # Make panel background white
+        panel.grid.major = element_blank(), # Remove major grid lines
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "gray")) # Remove minor grid lines
+
+# Create the second ggplot object (scatter plot with line)
+p2 <- ggplot(data = dat_g, aes(x = eGFR, y = Treatment.effect)) +
+  geom_point(color = rgb(red = 0, green = 0, blue = 1, alpha = 0.2)) +
+  #geom_smooth(method = "loess", color = 'red', se=FALSE) + # 'loess' for lowess smoothing
+  labs(x = "eGFR", y = "CATE using X-Learner")+
+  theme(plot.background = element_rect(fill = "white", colour = "white"), # Make plot background white
+        panel.background = element_rect(fill = "white", colour = NA), # Make panel background white
+        panel.grid.major = element_blank(), # Remove major grid lines
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "gray")) # Remove minor grid lines
+
+library(gridExtra)
+g_xlearner<- grid.arrange(p1, p2,
+                          ncol=2)
+dev.off()
+
+tiff("plot_rlearner.tiff", units="in", width=8, height=4, res=300)
+dat_g<-dat1
+dat_g$Treatment.effect<-hte_rboost
+p1<-ggplot(dat_g, aes(x=Treatment.effect, fill=as.factor(aspirin))) +
+  geom_histogram(binwidth=0.005, alpha=0.5, position="identity") +
+  scale_fill_manual(values=c("1"=rgb(0,0,1,1/8), "0"=rgb(1,0,0,1/8))) +
+  #scale_x_continuous(breaks=breaks, labels=labels) + # Set x-axis breaks and labels
+  labs(x="CATE using R-Learner", y="Number of people", fill="Aspirin Group") +
+  theme(legend.position = "top",
+        plot.background = element_rect(fill = "white", colour = "white"), # Make plot background white
+        panel.background = element_rect(fill = "white", colour = NA), # Make panel background white
+        panel.grid.major = element_blank(), # Remove major grid lines
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "gray")) # Remove minor grid lines
+
+# Create the second ggplot object (scatter plot with line)
+p2 <- ggplot(data = dat_g, aes(x = eGFR, y = Treatment.effect)) +
+  geom_point(color = rgb(red = 0, green = 0, blue = 1, alpha = 0.2)) +
+  #geom_smooth(method = "loess", color = 'red', se=FALSE) + # 'loess' for lowess smoothing
+  labs(x = "eGFR", y = "CATE using R-Learner")+
+  theme(plot.background = element_rect(fill = "white", colour = "white"), # Make plot background white
+        panel.background = element_rect(fill = "white", colour = NA), # Make panel background white
+        panel.grid.major = element_blank(), # Remove major grid lines
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "gray")) # Remove minor grid lines
+
+library(gridExtra)
+g_rlearner<- grid.arrange(p1, p2,
+                          ncol=2)
+dev.off()
