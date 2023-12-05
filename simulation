@@ -179,3 +179,266 @@ cp_all<- grid.arrange(fig_lasso+ ggtitle('Lasso'),
                       fig_bcf+ ggtitle('Bayesian causal forest'), 
                       fig_xboost+ ggtitle('Xlearner (XgBoost)'), 
                       ncol=2)
+
+
+################Other sample codes######################################
+##XBCF (accerelated BCF)
+library(XBCF)
+dat1<-dat0
+model<-glm(T~age + sbp + eGFR + statin, data=dat1, family=binomial(link="logit"))
+dat1$PS<-stats::predict(model, type="response")
+covariates<-c("age", "sbp", "eGFR", "statin")
+categorical_var<-c("statin")
+
+fit_xbcf<-XBCF(y <- dat1[, "Y"],
+               z <- dat1[, "T"],
+               x_con <- as.matrix(dat1[, covariates]),
+               pihat=dat1$PS,
+               #num_sweeps=500,
+               #burnin=300,
+               pcat_con=length(categorical_var),
+               #n_trees_con=300,
+               random_seed=123)
+
+hte_xbcf <-predictTaus(fit_xbcf, as.matrix(dat1[, covariates]))
+
+dat1$CATE<-hte_xbcf
+dat1$statin <- factor(dat1$statin)
+# Create the plot
+fig_xbcf<- ggplot(dat1, aes(x = eGFR, y = CATE, color = statin)) +
+  geom_point() +  # Add points
+  scale_color_manual(values = c(rgb(0,0,1,1/4), rgb(1,0,0,1/4))) +  # Set custom colors
+  theme_minimal() +  # Minimal theme
+  labs(x = "eGFR", y = "CATE", title = "")  # Add labels and title
+
+#########################################################################
+##Meta-learner R code
+ #Original code can be found in: Salditt M, et al. A Tutorial Introduction to Heterogeneous Treatment Effect Estimation with Meta-learners. 
+ #Adm Policy Ment Health. doi:10.1007/s10488-023-01303-9
+library(ranger)
+covariates<-c("age", "sbp", "eGFR", "statin")
+
+######################
+##S-learner
+dat1<-dat0
+mu_fit <- ranger(y = dat1$Y, x = dat1[, c("T", covariates)], keep.inbag = TRUE)
+
+# Predict mu_0 by setting A = 0 for all persons, use OOB predictions where applicable
+dat1TMP <- dat1
+dat1TMP$T <- 0
+mu0_hat_s <- rep(0, nrow(dat1))
+mu0_hat_s[dat1$T == 0] <- mu_fit$predictions[dat1$T == 0]
+mu0_hat_s[dat1$T == 1] <- predict(mu_fit, dat1TMP)$predictions[dat1$T == 1]
+
+# Predict mu_1 by setting A = 1 for all persons, use OOB predictions where applicable
+dat1TMP$T <- 1
+mu1_hat_s <- rep(0,  nrow(dat1))
+mu1_hat_s[dat1$T == 1] <- mu_fit$predictions[dat1$T == 1]
+mu1_hat_s[dat1$T == 0] <- predict(mu_fit, dat1TMP)$predictions[dat1$T == 0]
+
+# Compute the CATE as the difference between the predictions by treatment status (see Equation 5):
+cate_s <- mu1_hat_s - mu0_hat_s
+dat1$CATE<-cate_s
+dat1$statin <- factor(dat1$statin)
+# Create the plot
+fig_Sranger<- ggplot(dat1, aes(x = eGFR, y = CATE, color = statin)) +
+  geom_point() +  # Add points
+  scale_color_manual(values = c(rgb(0,0,1,1/4), rgb(1,0,0,1/4))) +  # Set custom colors
+  theme_minimal() +  # Minimal theme
+  labs(x = "eGFR", y = "CATE", title = "")  # Add labels and title
+
+######################
+##T-learner
+dat1<-dat0
+# Create separate data frames for the control and the treatment group:
+dat1_0 <- dat1[dat1$T == 0, ]
+dat1_1 <- dat1[dat1$T == 1, ]
+
+# Train a random forest for the control group data:
+mu0_fit <- ranger(y = dat1_0$Y, x = dat1_0[, covariates], keep.inbag = TRUE)
+
+# Obtain predictions for mu_0, use OOB predictions (see Sect. 6) where applicable:
+mu0_hat <- rep(0, nrow(dat1))
+mu0_hat[dat1$T == 0] <- mu0_fit$predictions # OOB predictions
+mu0_hat[dat1$T == 1] <- predict(mu0_fit, dat1_1)$predictions
+
+# Train a random forest for the treatment group data:
+mu1_fit <- ranger(y = dat1_1$Y, x = dat1_1[, covariates], keep.inbag = TRUE)
+
+# Obtain predictions for mu_1, use OOB predictions where applicable:
+mu1_hat <- rep(0, nrow(dat1))
+mu1_hat[dat1$T == 1] <- mu1_fit$predictions # OOB predictions
+mu1_hat[dat1$T == 0] <- predict(mu1_fit, dat1_0)$predictions
+
+# Compute CATE estimates:
+cate_t <- mu1_hat - mu0_hat
+dat1$CATE<-cate_t
+dat1$statin <- factor(dat1$statin)
+# Create the plot
+fig_Tranger<- ggplot(dat1, aes(x = eGFR, y = CATE, color = statin)) +
+  geom_point() +  # Add points
+  scale_color_manual(values = c(rgb(0,0,1,1/4), rgb(1,0,0,1/4))) +  # Set custom colors
+  theme_minimal() +  # Minimal theme
+  labs(x = "eGFR", y = "CATE", title = "")  # Add labels and title
+
+######################
+##X-learner 
+dat1<-dat0
+# Create separate data frames for the control and the treatment group:
+dat1_0 <- dat1[dat1$T == 0, ]
+dat1_1 <- dat1[dat1$T == 1, ]
+
+# Train a random forest for the control group data:
+mu0_fit <- ranger(y = dat1_0$Y, x = dat1_0[, covariates], keep.inbag = TRUE)
+
+# Obtain predictions for mu_0, use OOB predictions (see Sect. 6) where applicable:
+mu0_hat <- rep(0, nrow(dat1))
+mu0_hat[dat1$T == 0] <- mu0_fit$predictions # OOB predictions
+mu0_hat[dat1$T == 1] <- predict(mu0_fit, dat1_1)$predictions
+
+# Train a random forest for the treatment group data:
+mu1_fit <- ranger(y = dat1_1$Y, x = dat1_1[, covariates], keep.inbag = TRUE)
+
+# Obtain predictions for mu_1, use OOB predictions where applicable:
+mu1_hat <- rep(0, nrow(dat1))
+mu1_hat[dat1$T == 1] <- mu1_fit$predictions # OOB predictions
+mu1_hat[dat1$T == 0] <- predict(mu1_fit, dat1_0)$predictions
+
+# Compute the pseudo-outcome using the estimated conditional mean function from the respective other group
+psi_x_0 <- predict(mu1_fit, dat1_0)$predictions - dat1_0$Y
+psi_x_1 <- dat1_1$Y - predict(mu0_fit, dat1_1)$predictions
+
+# Fit random forest using the pseudo-outcome and the covariates separately in the two groups:
+tau_x_0_fit <- ranger(y = psi_x_0, x = dat1_0[, covariates], keep.inbag = TRUE)
+tau_x_1_fit <- ranger(y = psi_x_1, x = dat1_1[, covariates], keep.inbag = TRUE)
+
+# Predict treatment effects per group using the two resulting models, use OOB predictions where applicable:
+tau_x_0_hat <- rep(0, nrow(dat1))
+tau_x_0_hat[T == 0] <- tau_x_0_fit$predictions
+tau_x_0_hat[T == 1] <- predict(tau_x_0_fit, dat1_1)$predictions
+tau_x_1_hat <- rep(0, nrow(dat1))
+tau_x_1_hat[T == 1] <- tau_x_1_fit$predictions
+tau_x_1_hat[T == 0] <- predict(tau_x_1_fit, dat1_0)$predictions
+
+# Estimate the propensity score:
+ps_fit <- ranger(y = dat1$T, x = dat1[, covariates], probability = TRUE)
+ps_hat <- ps_fit$predictions[,2] # OOB predictions
+
+# Ensure positivity by adding/subtracting a small epsilon to estimated propensity scores close to zero/one:
+epsilon <- .01
+ps_hat <- ifelse(ps_hat < epsilon, epsilon, ifelse(ps_hat > 1 - epsilon, 1 - epsilon, ps_hat))
+
+# Compute the CATE as propensity score-weighted combination of the group-specific estimates
+cate_x <- ps_hat * tau_x_0_hat + (1 - ps_hat) * tau_x_1_hat
+dat1$CATE<-cate_x
+dat1$statin <- factor(dat1$statin)
+# Create the plot
+fig_Xranger<- ggplot(dat1, aes(x = eGFR, y = CATE, color = statin)) +
+  geom_point() +  # Add points
+  scale_color_manual(values = c(rgb(0,0,1,1/4), rgb(1,0,0,1/4))) +  # Set custom colors
+  theme_minimal() +  # Minimal theme
+  labs(x = "eGFR", y = "CATE", title = "")  # Add labels and title
+
+######################
+##DR-learner
+dat1<-dat0
+# Create separate data frames for the control and the treatment group:
+dat1_0 <- dat1[dat1$T == 0, ]
+dat1_1 <- dat1[dat1$T == 1, ]
+
+# Train a random forest for the control group data:
+mu0_fit <- ranger(y = dat1_0$Y, x = dat1_0[, covariates], keep.inbag = TRUE)
+
+# Obtain predictions for mu_0, use OOB predictions (see Sect. 6) where applicable:
+mu0_hat <- rep(0, nrow(dat1))
+mu0_hat[dat1$T == 0] <- mu0_fit$predictions # OOB predictions
+mu0_hat[dat1$T == 1] <- predict(mu0_fit, dat1_1)$predictions
+
+# Train a random forest for the treatment group data:
+mu1_fit <- ranger(y = dat1_1$Y, x = dat1_1[, covariates], keep.inbag = TRUE)
+
+# Obtain predictions for mu_1, use OOB predictions where applicable:
+mu1_hat <- rep(0, nrow(dat1))
+mu1_hat[dat1$T == 1] <- mu1_fit$predictions # OOB predictions
+mu1_hat[dat1$T == 0] <- predict(mu1_fit, dat1_0)$predictions
+
+# Compute the pseudo-outcome using the estimated conditional mean function from the respective other group
+psi_x_0 <- predict(mu1_fit, dat1_0)$predictions - dat1_0$Y
+psi_x_1 <- dat1_1$Y - predict(mu0_fit, dat1_1)$predictions
+
+# Fit random forest using the pseudo-outcome and the covariates separately in the two groups:
+tau_x_0_fit <- ranger(y = psi_x_0, x = dat1_0[, covariates], keep.inbag = TRUE)
+tau_x_1_fit <- ranger(y = psi_x_1, x = dat1_1[, covariates], keep.inbag = TRUE)
+
+# Predict treatment effects per group using the two resulting models, use OOB predictions where applicable:
+tau_x_0_hat <- rep(0, nrow(dat1))
+tau_x_0_hat[T == 0] <- tau_x_0_fit$predictions
+tau_x_0_hat[T == 1] <- predict(tau_x_0_fit, dat1_1)$predictions
+tau_x_1_hat <- rep(0, nrow(dat1))
+tau_x_1_hat[T == 1] <- tau_x_1_fit$predictions
+tau_x_1_hat[T == 0] <- predict(tau_x_1_fit, dat1_0)$predictions
+
+# Estimate the propensity score:
+ps_fit <- ranger(y = dat1$T, x = dat1[, covariates], probability = TRUE)
+ps_hat <- ps_fit$predictions[,2] # OOB predictions
+
+# Ensure positivity by adding/subtracting a small epsilon to estimated propensity scores close to zero/one:
+epsilon <- .01
+ps_hat <- ifelse(ps_hat < epsilon, epsilon, ifelse(ps_hat > 1 - epsilon, 1 - epsilon, ps_hat))
+
+# Compute the pseudo-outcome of the DR-learner (see Equation 10)
+augmentedTerm <- 1/ps_hat * (dat1$T * (dat1$Y - mu1_hat)) -
+  1/(1 - ps_hat) * ((1 - dat1$T) * (dat1$Y - mu0_hat))
+psi_dr <- mu1_hat - mu0_hat + augmentedTerm
+
+# Fit a random forest to the pseudo-outcome:
+tau_dr_fit <- ranger(y = psi_dr, x = dat1[, covariates], keep.inbag = TRUE)
+
+# Compute the CATE as the predictions from the pseudo-outcome regression
+cate_dr <- tau_dr_fit$predictions # OOB predictions
+dat1$CATE<-cate_dr
+dat1$statin <- factor(dat1$statin)
+# Create the plot
+fig_DRranger<- ggplot(dat1, aes(x = eGFR, y = CATE, color = statin)) +
+  geom_point() +  # Add points
+  scale_color_manual(values = c(rgb(0,0,1,1/4), rgb(1,0,0,1/4))) +  # Set custom colors
+  theme_minimal() +  # Minimal theme
+  labs(x = "eGFR", y = "CATE", title = "")  # Add labels and title
+
+######################
+##R-learner
+dat1<-dat0
+# Train a regression model for m(X) = E(Y|X) and obtain predictions
+m_fit <- ranger(y = dat1$Y, x = dat1[, covariates], keep.inbag = TRUE)
+m_hat <- m_fit$predictions # OOB predictions
+
+# Compute the pseudo-outcome of the R-learner (we already estimated the propensity score; see Equations 11 and 12)
+resid_treat <- dat1$T - ps_hat
+resid_out <- dat1$Y - m_hat
+psi_r <- resid_out / resid_treat
+
+# Compute weights
+w <- resid_treat ^ 2
+
+# Regress pseudo-outcome on covariates using weights w
+tau_r_fit <- ranger(y = psi_r, x = dat1[, covariates], case.weights = w, keep.inbag = TRUE)
+
+# Compute the CATE as the predictions from the weighted pseudo-outcome regression
+cate_r <- tau_r_fit$predictions # OOB predictions
+dat1$CATE<-cate_r
+dat1$statin <- factor(dat1$statin)
+# Create the plot
+fig_Rranger<- ggplot(dat1, aes(x = eGFR, y = CATE, color = statin)) +
+  geom_point() +  # Add points
+  scale_color_manual(values = c(rgb(0,0,1,1/4), rgb(1,0,0,1/4))) +  # Set custom colors
+  theme_minimal() +  # Minimal theme
+  labs(x = "eGFR", y = "CATE", title = "")  # Add labels and title
+
+cp_meta<- grid.arrange(fig_Sranger+ ggtitle('S learner'), 
+                       fig_Tranger+ ggtitle('T learner'), 
+                       fig_Xranger+ ggtitle('X learner'), 
+                       fig_DRranger+ ggtitle('DR learner'), 
+                       fig_Rranger+ ggtitle('R learner'), 
+                      # fig_xbcf+ ggtitle('XBCF'), 
+                       ncol=2)
+cp_meta
