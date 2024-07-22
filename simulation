@@ -1,13 +1,16 @@
 ##################Simulation codes##################
-##################Updated 2023/12/3#################
+##################Updated 2024/7/22#################
 rm(list = ls(all.names = TRUE))
 
 ###Install packages
-list.of.packages <- c( "dplyr","Hmisc", "FindIt", "dbarts", "grf", "rlearner",
-                       "BART", "tidytreatment", "dplyr", "tidybayes", "ggplot2")
+list.of.packages <- c( "dplyr","Hmisc", "FindIt", "dbarts", "grf", "rlearner", "tidyverse",
+                       "BART", "tidytreatment", "dplyr", "tidybayes", "ggplot2", "lmtest", "sandwich")
 new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
 if(length(new.packages)) install.packages(new.packages)
 lapply(list.of.packages, library, character.only = TRUE)
+library(devtools) 
+install_github("xnie/rlearner")
+install_github("socket778/XBCF")
 
 ###data generation
 N<-30000
@@ -30,8 +33,8 @@ Y1<- rbinom(N, 1, regY1)
 #scenario 2: non-linear relationship
 initial_beta2<-(0.05)
 beta2 <- ifelse(eGFR < 45, initial_beta2 * (1+(45 - 60)/20)+0.1*statin,
-               ifelse(eGFR >= 45 & eGFR < 90, initial_beta2 * (1+(eGFR - 60)/20)+0.1*statin,
-                      initial_beta2 * (1+(90 - 60)/20)+0.1*statin))
+                ifelse(eGFR >= 45 & eGFR < 90, initial_beta2 * (1+(eGFR - 60)/20)+0.1*statin,
+                       initial_beta2 * (1+(90 - 60)/20)+0.1*statin))
 regY2<- 0.20+beta2*T+0.001*(eGFR-60)+0.05*statin+0.001*(age-60)+0.001*(sbp-120)
 summary(regY2)
 regY2 <- pmin(pmax(regY2, 0), 1)
@@ -39,8 +42,10 @@ Y2<- rbinom(N, 1, regY2)
 
 ###Data analysis
 ##################################################
-Y<-Y2  #scenario 1
-#Y<-Y2  #scenario 2
+Y<-Y1  #scenario 1 (binary)
+#Y<-Y2  #scenario 2 (binary)
+#Y<-regY1 #scenario 3 (continuous)
+#Y<-regY2 #scenario 4 (continuous)
 dat0<- data.frame(age,  sbp,  eGFR, statin, T, Y)
 ##################################################
 
@@ -91,7 +96,7 @@ fig_grf<- ggplot(dat1, aes(x = eGFR, y = CATE, color = statin)) +
   labs(x = "eGFR", y = "CATE", title = "")  # Add labels and title
 
 ##BCF
- #https://cran.r-project.org/web/packages/tidytreatment/vignettes/use-tidytreatment-BART.html
+#https://cran.r-project.org/web/packages/tidytreatment/vignettes/use-tidytreatment-BART.html
 library(BART); library(tidytreatment); library(dplyr); library(tidybayes); library(ggplot2)
 dat1<-dat0
 dat1 <- dat1 %>%
@@ -147,41 +152,6 @@ fig_bcf<- ggplot(dat1, aes(x = eGFR, y = CATE, color = statin)) +
   theme_minimal() +  # Minimal theme
   labs(x = "eGFR", y = "CATE", title = "")  # Add labels and title
 
-#X-learners
-dat1<-dat0
-dat1 <- dat1 %>%
-  mutate_at(vars(statin), ~ as.numeric(as.character(.)))
-Y <-  as.numeric(dat1$Y)
-W <-  (dat1$T)
-X0 <-  subset(dat1, select=-Y)
-X1 <-  subset(X0, select=-T)
-X2 <-  as.matrix(X1)
-
-#install.packages("remotes")
-#remotes::install_github("xnie/rlearner")
-library(rlearner)
-set.seed(123)
-xboost_model = xboost(X2, W, Y)
-hte_xboost = predict(xboost_model, X2)
-
-dat1$CATE<-hte_xboost
-# Create the plot
-dat1$statin <- factor(dat1$statin)
-fig_xboost<- ggplot(dat1, aes(x = eGFR, y = CATE, color = statin)) +
-  geom_point() +  # Add points
-  scale_color_manual(values = c(rgb(0,0,1,1/4), rgb(1,0,0,1/4))) +  # Set custom colors
-  theme_minimal() +  # Minimal theme
-  labs(x = "eGFR", y = "CATE", title = "")  # Add labels and title
-
-library(gridExtra)
-cp_all<- grid.arrange(fig_lasso+ ggtitle('Lasso'), 
-                      fig_grf+ ggtitle('Causal forest'), 
-                      fig_bcf+ ggtitle('Bayesian causal forest'), 
-                      fig_xboost+ ggtitle('Xlearner (XgBoost)'), 
-                      ncol=2)
-
-
-################Other sample codes######################################
 ##XBCF (accerelated BCF)
 library(XBCF)
 dat1<-dat0
@@ -211,10 +181,17 @@ fig_xbcf<- ggplot(dat1, aes(x = eGFR, y = CATE, color = statin)) +
   theme_minimal() +  # Minimal theme
   labs(x = "eGFR", y = "CATE", title = "")  # Add labels and title
 
+library(gridExtra)
+cp_all<- grid.arrange(fig_lasso+ ggtitle('Lasso'), 
+                      fig_grf+ ggtitle('Causal forest'), 
+                      fig_bcf+ ggtitle('Bayesian causal forest'),
+                      fig_xbcf+ ggtitle('XBCF'),
+                      ncol=2)
+
 #########################################################################
 ##Meta-learner R code
- #Original code can be found in: Salditt M, et al. A Tutorial Introduction to Heterogeneous Treatment Effect Estimation with Meta-learners. 
- #Adm Policy Ment Health. doi:10.1007/s10488-023-01303-9
+#Original code can be found in: Salditt M, et al. A Tutorial Introduction to Heterogeneous Treatment Effect Estimation with Meta-learners. 
+#Adm Policy Ment Health. doi:10.1007/s10488-023-01303-9
 library(ranger)
 covariates<-c("age", "sbp", "eGFR", "statin")
 
@@ -439,6 +416,70 @@ cp_meta<- grid.arrange(fig_Sranger+ ggtitle('S learner'),
                        fig_Xranger+ ggtitle('X learner'), 
                        fig_DRranger+ ggtitle('DR learner'), 
                        fig_Rranger+ ggtitle('R learner'), 
-                      # fig_xbcf+ ggtitle('XBCF'), 
                        ncol=2)
 cp_meta
+
+#########################################################################
+##Evaluation of the model performance (example code for calibration)
+##Cross-fitting can be found in the following link
+##https://github.com/Koinoue/GRF-calibration/blob/main/AJEsimulation.r
+dat2<-dat1
+tau.hat <- hte_grf
+num.rankings<-5
+
+# Rank observations *within each fold* into quintiles according to their CATE predictions.
+ranking <- rep(NA, N)
+tau.hat.quantiles <- quantile(tau.hat, probs = seq(0, 1, by=1/num.rankings))
+ranking<- cut(tau.hat, tau.hat.quantiles, include.lowest=TRUE,labels=seq(num.rankings))
+
+# Valid only in randomized settings.
+# Average difference-in-means within each ranking
+
+# Formula y ~ 0 + ranking + ranking:w
+treatment <- "W"
+outcome <- "Y"
+fmla <- paste0(outcome, " ~ 0 + ranking + ranking:", treatment)
+ols.ate <- lm(fmla, data=transform(dat2, ranking=factor(ranking)))
+ols.ate <- coeftest(ols.ate, vcov=vcovHC(ols.ate, type='HC2'))
+interact <- which(grepl(":", rownames(ols.ate)))
+ols.ate <- data.frame("OLS", paste0("Q", seq(num.rankings)), ols.ate[interact, 1:2])
+rownames(ols.ate) <- NULL # just for display
+colnames(ols.ate) <- c("method", "ranking", "estimate", "std.err")
+ols.ate
+
+# Computing AIPW scores.
+e.hat <- model_grf$W.hat # P[W=1|X]
+m.hat <- model_grf$Y.hat # E[Y|X]
+
+# Estimating mu.hat(X, 1) and mu.hat(X, 0) for obs in held-out sample
+# Note: to understand this, read equations 6-8 in this vignette:
+# https://grf-labs.github.io/grf/articles/muhats.html
+mu.hat.0 <- m.hat - e.hat * tau.hat        # E[Y|X,W=0] = E[Y|X] - e(X)*tau(X)
+mu.hat.1 <- m.hat + (1 - e.hat) * tau.hat  # E[Y|X,W=1] = E[Y|X] + (1 - e(X))*tau(X)
+
+# AIPW scores
+aipw.scores <- tau.hat + W / e.hat * (Y -  mu.hat.1) - (1 - W) / (1 - e.hat) * (Y -  mu.hat.0)
+ols <- lm(aipw.scores ~ 0 + factor(ranking))
+forest.ate <- data.frame("AIPW", paste0("Q", seq(num.rankings)), coeftest(ols, vcov=vcovHC(ols, "HC2"))[,1:2])
+colnames(forest.ate) <- c("method", "ranking", "estimate", "std.err")
+rownames(forest.ate) <- NULL # just for display
+forest.ate
+
+# Concatenate the two results.
+res <- rbind(forest.ate, ols.ate)
+# Plotting the point estimate of average treatment effect 
+# and 95% confidence intervals around it.
+
+res %>%
+  as.data.frame() %>% 
+  ggplot(aes(x = ranking, y = estimate, group=method, color=method)) +
+  geom_point(position=position_dodge(0.3), size = 3) +
+  geom_errorbar(aes(ymin=estimate-2*std.err, ymax=estimate+2*std.err), width=.2, position=position_dodge(0.3)) +
+  ylab("") + xlab("") +
+  theme_minimal() +
+  theme(legend.position="bottom", legend.title = element_blank(), legend.text = element_text(size = 14, color = "black"),
+        text = element_text(size = 14, color = "black"),
+        axis.text = element_text(size = 14, color = "black")) +
+  xlab("CATE ranking") +
+  ylab("Estimated group-specific ATE")
+
