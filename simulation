@@ -1,16 +1,15 @@
 ##################Simulation codes##################
-##################Updated 2024/7/22#################
+##################Updated 2024/07/26#################
 rm(list = ls(all.names = TRUE))
 
 ###Install packages
-list.of.packages <- c( "dplyr","Hmisc", "FindIt", "dbarts", "grf", "rlearner", "tidyverse",
+list.of.packages <- c( "dplyr","Hmisc", "FindIt", "dbarts", "grf", "rlearner", "tidyverse", "bcf", 
                        "BART", "tidytreatment", "dplyr", "tidybayes", "ggplot2", "lmtest", "sandwich")
 new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
 if(length(new.packages)) install.packages(new.packages)
 lapply(list.of.packages, library, character.only = TRUE)
 library(devtools) 
 install_github("xnie/rlearner")
-install_github("socket778/XBCF")
 
 ###data generation
 N<-30000
@@ -96,86 +95,33 @@ fig_grf<- ggplot(dat1, aes(x = eGFR, y = CATE, color = statin)) +
   labs(x = "eGFR", y = "CATE", title = "")  # Add labels and title
 
 ##BCF
-#https://cran.r-project.org/web/packages/tidytreatment/vignettes/use-tidytreatment-BART.html
-library(BART); library(tidytreatment); library(dplyr); library(tidybayes); library(ggplot2)
+library(bcf)
 dat1<-dat0
 dat1 <- dat1 %>%
-  mutate_at(vars(statin), ~ as.numeric(as.character(.)))
+mutate_at(vars(statin), ~ as.numeric(as.character(.)))
 Y <-  (dat1$Y)
 W <-  (dat1$T)
 X0 <-  subset(dat1, select=-Y)
 X1 <-  subset(X0, select=-T)
+X2 <- as.matrix(X1)
+model <- glm(W ~ age + sbp + eGFR + statin, family = binomial)
+pi <- predict(model, type = "response")
 
-# STEP 1 VS Model: Regress y ~ covariates
-var_select_bart <- wbart(x.train = X1, 
-                         y.train = Y,
-                         sparse = TRUE)
+model_bcf <- bcf(y             = Y,
+              z                = W,
+              x_control        = X2,
+              x_moderate       = X2,
+              pihat            = pi,
+              nburn            = 2000,
+              nsim             = 1000)
 
-# STEP 2: Variable selection
-# select most important vars from y ~ covariates model
-# very simple selection mechanism. Should use cross-validation in practice
-covar_ranking <- covariate_importance(var_select_bart)
-var_select <- covar_ranking %>% 
-  filter(avg_inclusion >= quantile(avg_inclusion, 0.5)) %>%
-  pull(variable)
-# change categorical variables to just one variable
-var_select <- unique(gsub("c1[1-3]$","c1", var_select))
-var_select
+#summary(model_bcf)
 
-# STEP 3 PS Model: Regress z ~ selected covariates
-# BART::pbart is for probit regression 
-prop_bart <- pbart(
-  x.train = dplyr::select(dat1, all_of(var_select)), 
-  y.train = pull(dat1, T)
-) 
+dat1$CATE<-colMeans(model_bcf$tau)
 
-# store propensity score in data
-dat1$prop_score <-  prop_bart$prob.train.mean
-
-dat1$T <- as.logical(dat1$T)
-# Step 4 TE Model: Regress y ~ z + covariates + propensity score
-te_model <- wbart(
-  x.train = dplyr::select(dat1,-Y),
-  y.train = pull(dat1, Y),
-  x.test  = dplyr::select(dat1,-Y)
-)
-te<-  treatment_effects(te_model, treatment = "T", newdata = dat1)
-d.hte_bcf <-te %>% summarise(hte_bcf = median(cte))
-hte_bcf<- d.hte_bcf$hte_bcf  
-
-dat1$CATE<-hte_bcf
 # Create the plot
 dat1$statin <- factor(dat1$statin)
 fig_bcf<- ggplot(dat1, aes(x = eGFR, y = CATE, color = statin)) +
-  geom_point() +  # Add points
-  scale_color_manual(values = c(rgb(0,0,1,1/4), rgb(1,0,0,1/4))) +  # Set custom colors
-  theme_minimal() +  # Minimal theme
-  labs(x = "eGFR", y = "CATE", title = "")  # Add labels and title
-
-##XBCF (accerelated BCF)
-library(XBCF)
-dat1<-dat0
-model<-glm(T~age + sbp + eGFR + statin, data=dat1, family=binomial(link="logit"))
-dat1$PS<-stats::predict(model, type="response")
-covariates<-c("age", "sbp", "eGFR", "statin")
-categorical_var<-c("statin")
-
-fit_xbcf<-XBCF(y <- dat1[, "Y"],
-               z <- dat1[, "T"],
-               x_con <- as.matrix(dat1[, covariates]),
-               pihat=dat1$PS,
-               #num_sweeps=500,
-               #burnin=300,
-               pcat_con=length(categorical_var),
-               #n_trees_con=300,
-               random_seed=123)
-
-hte_xbcf <-predictTaus(fit_xbcf, as.matrix(dat1[, covariates]))
-
-dat1$CATE<-hte_xbcf
-dat1$statin <- factor(dat1$statin)
-# Create the plot
-fig_xbcf<- ggplot(dat1, aes(x = eGFR, y = CATE, color = statin)) +
   geom_point() +  # Add points
   scale_color_manual(values = c(rgb(0,0,1,1/4), rgb(1,0,0,1/4))) +  # Set custom colors
   theme_minimal() +  # Minimal theme
@@ -185,13 +131,13 @@ library(gridExtra)
 cp_all<- grid.arrange(fig_lasso+ ggtitle('Lasso'), 
                       fig_grf+ ggtitle('Causal forest'), 
                       fig_bcf+ ggtitle('Bayesian causal forest'),
-                      fig_xbcf+ ggtitle('XBCF'),
                       ncol=2)
 
 #########################################################################
 ##Meta-learner R code
 #Original code can be found in: Salditt M, et al. A Tutorial Introduction to Heterogeneous Treatment Effect Estimation with Meta-learners. 
 #Adm Policy Ment Health. doi:10.1007/s10488-023-01303-9
+#Other base learners can also be considered and applied (e.g., for continuous outcomes).
 library(ranger)
 covariates<-c("age", "sbp", "eGFR", "statin")
 
@@ -424,7 +370,7 @@ cp_meta
 ##Cross-fitting can be found in the following link
 ##https://github.com/Koinoue/GRF-calibration/blob/main/AJEsimulation.r
 dat2<-dat1
-tau.hat <- hte_grf
+tau.hat <- hte_grf #this is an example of causal forest but you can change to other algorithm to estimate tau.hat
 num.rankings<-5
 
 # Rank observations *within each fold* into quintiles according to their CATE predictions.
@@ -482,4 +428,3 @@ res %>%
         axis.text = element_text(size = 14, color = "black")) +
   xlab("CATE ranking") +
   ylab("Estimated group-specific ATE")
-
