@@ -49,7 +49,7 @@ lapply(list.of.packages, library, character.only = TRUE)
 
 ```{r}
 ###Step 2: Set parameters and data generation
-N<-3000
+N<-10000
 setseed<-123
 nthread<-8
 
@@ -87,10 +87,10 @@ data_1<- data.frame(age,  sbp,  eGFR, statin, T, Y)
 #scenario 2 (binary)
 Y<-Y2  
 data_2<- data.frame(age,  sbp,  eGFR, statin, T, Y)
-#scenario 3 (continuous)
+#scenario 1' (continuous)
 Y<-regY1  
 data_3<- data.frame(age,  sbp,  eGFR, statin, T, Y)
-#scenario 4 (continuous)
+#scenario 2' (continuous)
 Y<-regY2  
 data_4<- data.frame(age,  sbp,  eGFR, statin, T, Y)
 ```
